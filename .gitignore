@@ -21,6 +21,12 @@ __pycache__/
 icu_cdss/**/__pycache__/
 icu_cdss/**/*.pyc
 
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
