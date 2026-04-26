@@ -3,6 +3,7 @@
  */
 
 import React, { useCallback, useRef, useState } from 'react';
+import { Patient } from '../types';
 
 interface ShapFeature {
   name: string;
@@ -18,6 +19,10 @@ interface PredictionResult {
   top_features: ShapFeature[];
   sofa_total?: number;
   vent_prob?: number;
+}
+
+interface Props {
+  onPatientsPredicted: (patients: Patient[]) => void;
 }
 
 const VITAL_FIELDS = [
@@ -45,6 +50,84 @@ const RISK_BORDER: Record<string, string> = { LOW: 'border-emerald-500/30 bg-eme
 const RISK_BAR:    Record<string, string> = { LOW: 'bg-emerald-500', MODERATE: 'bg-amber-500', HIGH: 'bg-orange-500', CRITICAL: 'bg-red-500' };
 
 const API = 'http://localhost:8765';
+
+const toAcuity = (risk: PredictionResult['risk_level']): Patient['acuityLevel'] => {
+  if (risk === 'CRITICAL') return 'Critical';
+  if (risk === 'HIGH') return 'High';
+  if (risk === 'MODERATE') return 'Moderate';
+  return 'Low';
+};
+
+const diagnosisFor = (pred: PredictionResult) => {
+  if (pred.sepsis_risk >= 0.7) return 'Suspected Sepsis / High Deterioration Risk';
+  if ((pred.vent_prob ?? 0) >= 0.5) return 'Respiratory Failure / Vent Risk';
+  if ((pred.sofa_total ?? 0) >= 4) return 'Organ Dysfunction Under Investigation';
+  return 'ICU Observation';
+};
+
+const numeric = (form: Record<string, string>, key: string, fallback: number) => {
+  const value = Number(form[key]);
+  return Number.isFinite(value) ? value : fallback;
+};
+
+const predictionToPatient = (
+  pred: PredictionResult,
+  form: Record<string, string> = {},
+  index = 0,
+): Patient => {
+  const sofa = Number(pred.sofa_total ?? 0);
+  const gcs = numeric(form, 'gcs_total', 15);
+  const ventProb = Number(pred.vent_prob ?? 0);
+  const xai = pred.top_features.map(f => ({
+    feature: f.name,
+    contribution: Number(f.shap ?? 0),
+    impact: Math.abs(Number(f.shap ?? 0)) > 0.5 ? 'High' as const : Math.abs(Number(f.shap ?? 0)) > 0.2 ? 'Medium' as const : 'Low' as const,
+  }));
+  const patientName = `Patient ${pred.patient_id}`;
+  const losDays = Math.max(0.5, Number((2.5 + pred.sepsis_risk * 5 + ventProb * 2).toFixed(1)));
+
+  return {
+    id: pred.patient_id || `UPLOAD-${index + 1}`,
+    name: patientName,
+    age: numeric(form, 'age', 60),
+    gender: 'Unknown',
+    admissionTime: new Date().toISOString(),
+    vitals: {
+      heartRate: numeric(form, 'heart_rate', 80),
+      systolicBP: numeric(form, 'sbp', 120),
+      temperature: numeric(form, 'temperature', 37),
+      respiratoryRate: numeric(form, 'resp_rate', 16),
+      oxygenSaturation: numeric(form, 'spo2', 97),
+    },
+    labs: {
+      wbc: numeric(form, 'wbc', 9),
+      lactate: numeric(form, 'lactate', 1.2),
+      creatinine: numeric(form, 'creatinine', 1),
+      crp: numeric(form, 'bilirubin', 0.7) * 30,
+      platelets: numeric(form, 'platelet', 220),
+      bilirubin: numeric(form, 'bilirubin', 0.7),
+    },
+    clinicalScores: {
+      sofa,
+      gcs,
+      apacheII: Math.min(40, Math.max(4, Math.round(sofa * 2 + (15 - gcs) + ventProb * 8))),
+    },
+    allergies: ['None Documented'],
+    preExistingConditions: ['User-entered intake record'],
+    medications: [],
+    sepsisRisk: pred.sepsis_risk,
+    predictedLOS: losDays,
+    diagnosis: diagnosisFor(pred),
+    acuityLevel: toAcuity(pred.risk_level),
+    localXai: xai,
+    localHighlights: [
+      `Sepsis risk ${(pred.sepsis_risk * 100).toFixed(1)}% — ${pred.alert_6h ? 'ALERT' : 'monitor'}.`,
+      `Ventilator risk ${((pred.vent_prob ?? 0) * 100).toFixed(0)}%.`,
+      `SOFA score ${sofa}/24 from entered values.`,
+    ],
+    localSummary: `${patientName} was added from the patient data ingestion panel. The model estimates ${(pred.sepsis_risk * 100).toFixed(1)}% sepsis risk and ${((pred.vent_prob ?? 0) * 100).toFixed(0)}% ventilator risk. This patient is now available in the Active Patient List and can be reviewed like the sampled ICU patients.`,
+  };
+};
 
 // ── Prediction card ───────────────────────────────────────────────────────────
 
@@ -118,7 +201,7 @@ const PredictionCard: React.FC<{ pred: PredictionResult }> = ({ pred }) => {
 
 type Mode = 'csv' | 'manual';
 
-const PatientUpload: React.FC = () => {
+const PatientUpload: React.FC<Props> = ({ onPatientsPredicted }) => {
   const [mode, setMode]               = useState<Mode>('csv');
   const [dragging, setDragging]       = useState(false);
   const [loading, setLoading]         = useState(false);
@@ -141,7 +224,9 @@ const PatientUpload: React.FC = () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
       setRowCount(data.row_count ?? 0);
-      setPredictions(data.predictions ?? []);
+      const nextPredictions = data.predictions ?? [];
+      setPredictions(nextPredictions);
+      onPatientsPredicted(nextPredictions.map((pred: PredictionResult, index: number) => predictionToPatient(pred, {}, index)));
     } catch (e: any) {
       setError(e.message ?? 'Upload failed. Is the backend running?');
     } finally { setLoading(false); }
@@ -150,7 +235,10 @@ const PatientUpload: React.FC = () => {
   const submitManual = async () => {
     setLoading(true); reset();
     const body: Record<string, any> = { patient_id: patientId };
-    Object.entries(form).forEach(([k, v]) => { if (v.trim()) body[k] = parseFloat(v); });
+    Object.entries(form).forEach(([k, v]) => {
+      const value = String(v);
+      if (value.trim()) body[k] = parseFloat(value);
+    });
     try {
       const res  = await fetch(`${API}/api/predict/manual`, {
         method: 'POST',
@@ -160,7 +248,10 @@ const PatientUpload: React.FC = () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
       setRowCount(1);
-      if (data.prediction) setPredictions([data.prediction]);
+      if (data.prediction) {
+        setPredictions([data.prediction]);
+        onPatientsPredicted([predictionToPatient(data.prediction, form)]);
+      }
     } catch (e: any) {
       setError(e.message ?? 'Prediction failed. Is the backend running?');
     } finally { setLoading(false); }
