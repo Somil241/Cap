@@ -12,6 +12,10 @@ Endpoints (all JSON, all read-only unless noted):
   GET  /api/resources                    derived resource-need rows
   GET  /api/xai/{stay_id}                top-K SHAP factors for the sepsis pred
 
+  POST /api/predict/csv                 upload a CSV → per-row predictions
+  POST /api/predict/manual              JSON vitals/labs → one prediction
+  GET  /api/predict/template            download CSV template
+
 The server lazy-loads the trained model artefacts from icu_cdss/models on the
 first request that needs them, so cold start is cheap. Predictions are cached
 per (stay_id, latest_charttime) for the lifetime of the process.
@@ -19,6 +23,7 @@ per (stay_id, latest_charttime) for the lifetime of the process.
 
 from __future__ import annotations
 
+import io
 import json
 import pickle
 from datetime import datetime, timedelta
@@ -30,7 +35,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 import sys
@@ -568,6 +573,170 @@ def xai_factors(stay_id: int) -> list[dict]:
         out.append({"feature": f["name"], "contribution": round(contribution, 3), "impact": impact})
     return out
 
+
+# ---------------------------------------------------------------------------
+# NEW: Patient upload / manual prediction endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/predict/csv")
+async def predict_csv(file: UploadFile = File(...)):
+    """
+    Upload a CSV file and get per-row sepsis predictions.
+
+    Required: any columns from the list below (all others are zero-filled).
+    Optional but recommended: patient_id, charttime
+
+    Vital columns:  heart_rate, sbp, dbp, map, spo2, resp_rate, temperature, gcs_total
+    Lab columns:    lactate, creatinine, bilirubin, wbc, platelet, pao2_fio2
+    """
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(400, "Only .csv files are accepted.")
+
+    content = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+    except Exception as exc:
+        raise HTTPException(400, f"Could not parse CSV: {exc}")
+
+    # Normalise column names to match MIMIC feature names
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    if "patient_id" not in df.columns:
+        df["patient_id"] = [f"ROW-{i + 1}" for i in range(len(df))]
+
+    sx, sx_feats = sepsis_xgb()
+    vx, vx_feats = vent_xgb()
+
+    results = []
+    for _, row in df.iterrows():
+        row_df = pd.DataFrame([row])
+        X_sep = _pick_features(row_df, sx_feats)
+        X_ven = _pick_features(row_df, vx_feats)
+
+        sepsis_prob = float(sx.predict_proba(X_sep)[0, 1])
+        vent_prob   = float(vx.predict_proba(X_ven)[0, 1])
+
+        risk = (
+            "CRITICAL" if sepsis_prob >= 0.75
+            else "HIGH"     if sepsis_prob >= 0.55
+            else "MODERATE" if sepsis_prob >= 0.35
+            else "LOW"
+        )
+
+        try:
+            top = top_shap_features_tree(sx, X_sep, top_k=5)
+        except Exception:
+            top = []
+
+        results.append({
+            "patient_id":   str(row.get("patient_id", "unknown")),
+            "sepsis_risk":  round(sepsis_prob, 4),
+            "vent_prob":    round(vent_prob, 4),
+            "risk_level":   risk,
+            "alert_6h":     sepsis_prob >= 0.55,
+            "top_features": top,
+        })
+
+    return {"status": "ok", "row_count": len(df), "predictions": results}
+
+
+@app.post("/api/predict/manual")
+async def predict_manual(body: dict):
+    """
+    Send a single patient's vitals/labs as JSON and get one prediction back.
+
+    Example:
+    {
+      "patient_id": "PT-001",
+      "heart_rate": 105, "sbp": 95, "map": 68,
+      "spo2": 91, "resp_rate": 24, "temperature": 38.6,
+      "gcs_total": 13, "lactate": 3.1, "creatinine": 1.8,
+      "wbc": 18.5, "platelet": 110, "bilirubin": 1.4, "pao2_fio2": 220
+    }
+
+    All fields optional — missing ones are zero-filled.
+    """
+    df = pd.DataFrame([{k.lower().replace(" ", "_"): v for k, v in body.items()}])
+
+    sx, sx_feats = sepsis_xgb()
+    vx, vx_feats = vent_xgb()
+
+    X_sep = _pick_features(df, sx_feats)
+    X_ven = _pick_features(df, vx_feats)
+
+    sepsis_prob = float(sx.predict_proba(X_sep)[0, 1])
+    vent_prob   = float(vx.predict_proba(X_ven)[0, 1])
+
+    # Best-effort SOFA from whatever the user supplied
+    def g(col: str, default: float = 0.0) -> float:
+        return float(df.iloc[0][col]) if col in df.columns else default
+
+    sofa_total = sum([
+        4 if g("pao2_fio2", 400) < 100 else 3 if g("pao2_fio2", 400) < 200 else 2 if g("pao2_fio2", 400) < 300 else 1 if g("pao2_fio2", 400) < 400 else 0,
+        4 if g("creatinine") >= 5   else 3 if g("creatinine") >= 3.5 else 2 if g("creatinine") >= 2   else 1 if g("creatinine") >= 1.2 else 0,
+        4 if g("bilirubin")  >= 12  else 3 if g("bilirubin")  >= 6   else 2 if g("bilirubin")  >= 2   else 1 if g("bilirubin")  >= 1.2 else 0,
+        4 if g("gcs_total", 15) < 6 else 3 if g("gcs_total", 15) < 10 else 2 if g("gcs_total", 15) < 13 else 1 if g("gcs_total", 15) < 15 else 0,
+        1 if g("map", 80) < 70 else 0,
+        4 if g("platelet", 250) < 20 else 3 if g("platelet", 250) < 50 else 2 if g("platelet", 250) < 100 else 1 if g("platelet", 250) < 150 else 0,
+    ])
+
+    risk = (
+        "CRITICAL" if sepsis_prob >= 0.75
+        else "HIGH"     if sepsis_prob >= 0.55
+        else "MODERATE" if sepsis_prob >= 0.35
+        else "LOW"
+    )
+
+    try:
+        top = top_shap_features_tree(sx, X_sep, top_k=5)
+    except Exception:
+        top = []
+
+    return {
+        "status": "ok",
+        "prediction": {
+            "patient_id":   str(body.get("patient_id", "MANUAL-001")),
+            "sepsis_risk":  round(sepsis_prob, 4),
+            "vent_prob":    round(vent_prob, 4),
+            "sofa_total":   sofa_total,
+            "risk_level":   risk,
+            "alert_6h":     sepsis_prob >= 0.55,
+            "top_features": top,
+        },
+    }
+
+
+@app.get("/api/predict/template")
+def predict_template():
+    """
+    Returns a CSV template with example rows so the frontend Download button works.
+    """
+    cols = [
+        "patient_id", "charttime",
+        "heart_rate", "sbp", "dbp", "map", "spo2", "resp_rate", "temperature", "gcs_total",
+        "lactate", "creatinine", "bilirubin", "wbc", "platelet", "pao2_fio2",
+    ]
+    example_rows = [
+        {"patient_id": "PT-001", "charttime": "2150-01-01 08:00",
+         "heart_rate": 88,  "sbp": 115, "dbp": 72, "map": 86,  "spo2": 97, "resp_rate": 18,
+         "temperature": 37.1, "gcs_total": 15, "lactate": 1.2, "creatinine": 0.9,
+         "bilirubin": 0.6, "wbc": 9.1,  "platelet": 220, "pao2_fio2": 380},
+        {"patient_id": "PT-001", "charttime": "2150-01-01 09:00",
+         "heart_rate": 95,  "sbp": 108, "dbp": 68, "map": 81,  "spo2": 95, "resp_rate": 20,
+         "temperature": 37.4, "gcs_total": 14, "lactate": 1.5, "creatinine": 1.0,
+         "bilirubin": 0.7, "wbc": 10.2, "platelet": 210, "pao2_fio2": 340},
+        {"patient_id": "PT-002", "charttime": "2150-01-01 08:00",
+         "heart_rate": 110, "sbp": 90,  "dbp": 60, "map": 70,  "spo2": 91, "resp_rate": 24,
+         "temperature": 38.6, "gcs_total": 13, "lactate": 3.1, "creatinine": 1.8,
+         "bilirubin": 1.2, "wbc": 14.5, "platelet": 140, "pao2_fio2": 240},
+    ]
+    return {"columns": cols, "example_rows": example_rows}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import os
