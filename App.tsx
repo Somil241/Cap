@@ -5,6 +5,7 @@ import PatientCard from './components/PatientCard';
 import PatientAnalysis from './components/PatientAnalysis';
 import PredictiveChart from './components/PredictiveChart';
 import ResourceForecastCard from './components/ResourceForecastCard';
+import PatientUpload from './components/PatientUpload';
 import {
   fetchBedForecast,
   fetchPatients,
@@ -50,8 +51,6 @@ const App: React.FC = () => {
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    // The "Upload Records" action used to fabricate patients via Groq.
-    // It now refreshes the dashboard with a fresh sample from the CDSS API.
     await loadDashboard(12);
     if (event.target) event.target.value = '';
   };
@@ -113,6 +112,7 @@ const App: React.FC = () => {
       )}
 
       <main className="max-w-[1600px] mx-auto w-full flex-1 p-4 md:p-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+
         {/* Side Panel */}
         <aside className="lg:col-span-3 space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-1 gap-4">
@@ -213,7 +213,6 @@ const App: React.FC = () => {
                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{isProcessing ? 'Syncing…' : 'Real-time'}</span>
               </div>
             </div>
-
             <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
               <div className="xl:col-span-7 overflow-hidden">
                 <PredictiveChart data={forecast} />
@@ -223,6 +222,10 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {/* ── NEW: Patient Upload Panel ── */}
+          <PatientUpload />
+
         </div>
       </main>
 
