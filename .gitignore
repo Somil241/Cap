@@ -1,0 +1,33 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Processed data, outputs, models, and pycache directories
+icu_cdss/data/processed/
+icu_cdss/outputs/
+icu_cdss/models/
+__pycache__/
+*.pyc
+icu_cdss/**/__pycache__/
+icu_cdss/**/*.pyc
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

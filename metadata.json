@@ -1,0 +1,5 @@
+
+{
+  "name": "MIMIC-Insight: ICU Resource Forecaster",
+  "description": "A high-performance clinical decision support dashboard using Gemini AI to predict sepsis risk, length of stay, and ICU bed demand, featuring Explainable AI (XAI) for interpretable medical insights."
+}

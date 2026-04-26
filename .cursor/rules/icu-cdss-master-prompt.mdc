@@ -1,0 +1,485 @@
+---
+description: ICU CDSS master build and modeling specification
+alwaysApply: true
+---
+
+# ICU Clinical Decision Support System — Cursor Master Prompt
+
+Use this as the authoritative project rule. Every module built in this repository must conform to these specs unless a section explicitly says otherwise.
+
+## 1. Project overview
+
+Build a multi-model clinical decision support system (CDSS) for ICUs, trained on MIMIC-IV data.
+The system runs five interconnected ML models and surfaces all outputs through a single plain-English bedside report.
+
+| # | Model | Core task |
+|---|-------|-----------|
+| 1 | Sepsis predictor | Flag patients likely to develop sepsis 6–12 h before clinical diagnosis |
+| 2 | ICU bed demand forecaster | Predict unit-level bed counts needed in the next 24–72 h |
+| 3 | Ventilator forecaster | Predict which patients will need mechanical ventilation and for how long |
+| 4 | Length-of-stay (LOS) estimator | Predict remaining ICU days per patient, updated every hour |
+| 5 | Clinical summary generator | Translate all model outputs into plain English for the bedside clinician |
+
+## 2. Repository layout
+
+```
+icu_cdss/
+├── data/
+│   ├── raw/               ← .csv.gz files from MIMIC-IV go here (never committed to git)
+│   └── processed/         ← cleaned parquet files (auto-generated, gitignored)
+├── models/                ← serialised model artefacts (.ubj, .pt, .pkl)
+├── outputs/               ← evaluation plots, SHAP charts, NLG reports
+├── src/
+│   ├── config.py          ← single source of truth for all paths, itemIDs, constants
+│   ├── explore.py         ← one-time data inspection script
+│   ├── data_extractor.py  ← chunk-reads large .gz files → filtered parquet
+│   ├── etl_pipeline.py    ← cohort filtering, imputation, resampling
+│   ├── feature_engineer.py← 287-feature expansion
+│   ├── label_creator.py   ← Sepsis-3 labels (model 1)
+│   ├── dataset_builder.py ← merge, temporal split, SMOTE
+│   ├── models/
+│   │   ├── sepsis/
+│   │   │   ├── xgboost_model.py
+│   │   │   ├── lstm_model.py
+│   │   │   └── ensemble.py
+│   │   ├── bed_demand/
+│   │   │   ├── forecaster.py
+│   │   │   └── lstm_forecaster.py
+│   │   ├── ventilator/
+│   │   │   ├── classifier.py       ← will patient need ventilation?
+│   │   │   └── duration_model.py   ← survival model for vent hours
+│   │   ├── los/
+│   │   │   ├── regressor.py
+│   │   │   └── survival_model.py
+│   │   └── nlg/
+│   │       ├── summary_generator.py
+│   │       └── templates/          ← Jinja2 fallback templates
+│   ├── explainability.py   ← SHAP + LIME (shared across models)
+│   ├── aggregator.py       ← merges all model outputs into one payload
+│   └── main.py             ← runs the full pipeline end-to-end
+├── tests/
+├── requirements.txt
+└── README.md
+```
+
+## 3. Data source — MIMIC-IV
+
+### Files required
+
+`icu/` folder:
+- `icustays.csv.gz`
+- `chartevents.csv.gz`
+- `inputevents.csv.gz`
+- `outputevents.csv.gz`
+- `procedureevents.csv.gz`
+
+`hosp/` folder:
+- `patients.csv.gz`
+- `admissions.csv.gz`
+- `labevents.csv.gz`
+- `microbiologyevents.csv.gz`
+- `prescriptions.csv.gz`
+- `d_labitems.csv.gz`
+- `d_items.csv.gz`
+
+### Large-file rule (mandatory)
+
+`chartevents.csv.gz` and `labevents.csv.gz` are >25 GB uncompressed.
+Always read them in chunks of 100,000 rows. Never load them fully into memory.
+
+```python
+for chunk in pd.read_csv(
+    "data/raw/icu/chartevents.csv.gz",
+    chunksize=100_000,
+    compression="gzip",
+):
+    # filter immediately, accumulate only what you need
+```
+
+## 4. `config.py` — constants (never hardcode elsewhere)
+
+```python
+# ── Paths ──────────────────────────────────────────────────────────────
+RAW_DIR       = "data/raw"
+PROCESSED_DIR = "data/processed"
+MODELS_DIR    = "models"
+OUTPUTS_DIR   = "outputs"
+
+# ── Vital sign itemIDs (chartevents) ───────────────────────────────────
+VITAL_ITEMIDS = {
+    "heart_rate":        220045,
+    "spo2":              220277,
+    "sbp":               220179,
+    "dbp":               220180,
+    "mbp":               220052,
+    "resp_rate":         220210,
+    "temperature":       223761,
+    "gcs_total":         223900,
+}
+
+# ── Lab itemIDs (labevents) ─────────────────────────────────────────────
+LAB_ITEMIDS = {
+    "lactate":           50813,
+    "creatinine":        50912,
+    "wbc":               51301,
+    "platelets":         51265,
+    "bilirubin":         50885,
+    "pao2":              50821,
+    "fio2":              50816,
+    "sodium":            50983,
+    "potassium":         50971,
+}
+
+# ── Sepsis label ────────────────────────────────────────────────────────
+ANTIBIOTIC_KEYWORDS = [
+    "vancomycin", "meropenem", "piperacillin", "cefepime",
+    "metronidazole", "ciprofloxacin", "linezolid", "ampicillin",
+]
+SEPSIS_LOOKAHEAD_HOURS  = 6       # label = 1 if onset within next N hours
+SOFA_THRESHOLD          = 2       # SOFA increase required for Sepsis-3
+
+# ── Modelling ───────────────────────────────────────────────────────────
+LSTM_SEQUENCE_HOURS     = 24      # look-back window for LSTM models
+RESAMPLE_FREQ           = "1h"    # time-series grid resolution
+TRAIN_CUTOFF_YEAR       = 2180    # MIMIC uses privacy-shifted dates (2100s–2200s)
+VAL_CUTOFF_YEAR         = 2190
+TEST_FROM_YEAR          = 2190
+
+# ── Bed demand ──────────────────────────────────────────────────────────
+BED_FORECAST_HORIZONS   = [24, 48, 72]   # hours ahead
+
+# ── Ventilator ──────────────────────────────────────────────────────────
+VENT_ITEMIDS = [225792, 225794]   # chartevents: invasive / non-invasive vent start
+
+# ── LOS ─────────────────────────────────────────────────────────────────
+LOS_MAX_DAYS            = 30      # clip extreme outliers
+```
+
+## 5. Step-by-step build order
+
+Follow this order exactly. Each step produces an artefact the next step depends on.
+
+### Step 1 — Environment
+
+```
+pip install pandas numpy scikit-learn xgboost lightgbm tensorflow shap lime \
+            imbalanced-learn optuna mlflow matplotlib seaborn pyarrow \
+            fastparquet lifelines jinja2
+```
+
+### Step 2 — `explore.py`
+
+Before writing any model code, inspect the data:
+- Print column names and dtypes for every file.
+- Confirm all itemIDs in `config.py` actually exist in `d_items` / `d_labitems`.
+- Check date ranges (MIMIC dates are in 2100s).
+- Count rows, nulls, unique patients.
+- Log all findings to `outputs/exploration_report.txt`.
+
+### Step 3 — `data_extractor.py`
+
+- Chunk-read `chartevents.csv.gz`, keep only rows where `itemid` is in `VITAL_ITEMIDS.values()`.
+- Save to `data/processed/vitals.parquet`.
+- Chunk-read `labevents.csv.gz`, keep only rows where `itemid` is in `LAB_ITEMIDS.values()`.
+- Save to `data/processed/labs.parquet`.
+- All downstream modules read parquet, never the raw `.gz` again.
+
+### Step 4 — `etl_pipeline.py`
+
+Returns a single dataframe: one row per `(stay_id, hour)`.
+
+Cohort filters (apply in this order):
+1. Age >= 18 (join `patients.csv.gz` for `anchor_age`).
+2. ICU stay length >= 4 hours.
+3. Drop stays with >80% missing vitals after resampling.
+
+Imputation:
+- Vitals: forward-fill within each stay (last known reading is clinically valid).
+- Labs: median-impute per stay (stale lab values can be misleading).
+
+Outlier bounds:
+
+| Feature | Min | Max |
+|---------|-----|-----|
+| Heart rate | 0 | 300 |
+| SpO2 | 50 | 100 |
+| Temperature (C) | 25 | 45 |
+| SBP | 40 | 300 |
+| Resp rate | 0 | 80 |
+| WBC | 0 | 200 |
+| Creatinine | 0 | 30 |
+
+Resampling: `df.resample("1h").mean()` per stay after setting a datetime index.
+
+Output: `data/processed/cohort_hourly.parquet`
+
+### Step 5 — `feature_engineer.py`
+
+Input: `cohort_hourly.parquet`
+Output: `data/processed/features.parquet` — 287 features per patient-hour.
+
+Feature groups:
+
+| Group | Details |
+|-------|---------|
+| Raw values | All vitals and labs as-is |
+| Rolling mean | 1 h, 6 h, 24 h window per feature |
+| Rolling std | 1 h, 6 h, 24 h window per feature |
+| Rate of change | `value_t - value_{t-1}` |
+| SOFA score | 6 organ system sub-scores (respiratory, coagulation, liver, cardiovascular, CNS, renal) |
+| Shock index | `heart_rate / sbp` |
+| NEWS2 components | Per the Royal College of Physicians scoring table |
+| Cumulative fluid balance | From `inputevents` - `outputevents` |
+| Time-in-ICU | Hours since admission |
+
+### Step 6 — `label_creator.py` (sepsis model only)
+
+Implement the Sepsis-3 definition:
+Sepsis onset = suspected infection (antibiotic + blood culture within 72 h of each other) AND SOFA >= 2 increase from baseline.
+
+For every patient-hour:
+- `label = 1` if sepsis onset falls within the next `SEPSIS_LOOKAHEAD_HOURS` hours.
+- `label = 0` otherwise.
+- Exclude all hours at and after onset from the training set (no peeking).
+
+Expected positive rate: ~10–11%. Log the exact figure.
+
+### Step 7 — `dataset_builder.py`
+
+1. Merge `features.parquet` with labels.
+2. Temporal split — do not use random split:
+   - Train: stays with `intime.year < TRAIN_CUTOFF_YEAR`
+   - Val: `TRAIN_CUTOFF_YEAR <= year < VAL_CUTOFF_YEAR`
+   - Test: `year >= TEST_FROM_YEAR`
+3. Apply SMOTE to the training set only after splitting. Never to val/test.
+4. Save train/val/test as separate parquet files.
+
+## 6. Model specifications
+
+### 6.1 — Sepsis predictor (`models/sepsis/`)
+
+XGBoost (`xgboost_model.py`):
+- Input: flat 287-feature row for the current hour.
+- Handle imbalance via `scale_pos_weight = n_neg / n_pos`.
+- Tune with Optuna (100 Bayesian trials): `max_depth`, `learning_rate`, `subsample`, `colsample_bytree`, `min_child_weight`.
+- Expose `predict_proba(X) -> float`.
+- Log every trial to MLflow.
+
+LSTM (`lstm_model.py`):
+- Input shape: `(batch, LSTM_SEQUENCE_HOURS, 287)`.
+- Architecture: 2-layer LSTM (128 -> 64 units) -> Dropout(0.3) -> Dense(1, sigmoid).
+- Loss: focal loss (`alpha=0.25, gamma=2`).
+- Early stopping on val AUROC, patience = 5 epochs.
+- Expose `predict_proba(X_seq) -> float`.
+
+Ensemble (`ensemble.py`):
+- Final score: `0.6 * xgb_prob + 0.4 * lstm_prob`.
+- Calibrate threshold on validation set to maximise F1.
+- Target: AUROC >= 0.86 on test set.
+
+### 6.2 — ICU bed demand forecaster (`models/bed_demand/`)
+
+Goal: predict how many ICU beds will be occupied in each unit at T+24, T+48, T+72 hours.
+
+Data sources:
+- `icustays.csv.gz`: `intime`, `outtime`, `first_careunit`.
+- Derive hourly occupancy per unit by counting overlapping stays.
+- External features: day-of-week, hour-of-day, rolling 7-day admissions, seasonal index.
+
+Model (`forecaster.py`):
+- LightGBM regression, one model per horizon (24 h, 48 h, 72 h).
+- Features: current occupancy, rolling 24 h admissions, discharge rate, time features.
+- Output per unit: `{unit_name: predicted_beds}` for each horizon.
+- Report RMSE and MAPE on test set.
+
+LSTM forecaster (`lstm_forecaster.py`):
+- Multi-step seq2seq: encode 7-day history, decode 3-day forecast.
+- Input: hourly unit-level occupancy time series.
+- Ensemble with LightGBM: `0.5 * lgbm + 0.5 * lstm`.
+
+### 6.3 — Ventilator forecaster (`models/ventilator/`)
+
+Goal: (a) binary — will this patient need mechanical ventilation in the next 24 h?
+(b) regression — how many hours will they be ventilated?
+
+Ventilation labels:
+- Vent start: `chartevents` rows where `itemid` in `VENT_ITEMIDS` and `value = "Invasive Ventilation"`.
+- Binary label: 1 if vent starts within next 24 h, 0 otherwise.
+- Duration label: hours from vent start to vent stop (from `procedureevents`).
+
+Classifier (`classifier.py`):
+- XGBoost binary classifier on the 287-feature matrix plus PaO2/FiO2 ratio, PEEP, ventilator settings history.
+- Tune with Optuna (50 trials).
+- Report AUROC, sensitivity, specificity.
+
+Duration model (`duration_model.py`):
+- Cox proportional hazards (via `lifelines.CoxPHFitter`) for time-to-extubation.
+- Output: median predicted vent duration + 80% confidence interval in hours.
+
+### 6.4 — Length-of-stay estimator (`models/los/`)
+
+Goal: predict remaining ICU days for each patient, updated every hour.
+
+Labels:
+- `remaining_los_hours = outtime - current_time` per patient-hour.
+- Clip at `LOS_MAX_DAYS * 24` hours.
+
+Regressor (`regressor.py`):
+- LightGBM regression.
+- Features: all 287 engineered features + hours-already-in-ICU + admission diagnosis (encoded).
+- Tune with Optuna (50 trials).
+- Report MAE and median absolute error on test set.
+
+Survival model (`survival_model.py`):
+- Kaplan-Meier + accelerated failure time model for probabilistic LOS.
+- Output: point estimate + `[10th, 90th]` percentile band.
+- Updated hourly as new measurements arrive.
+
+### 6.5 — Clinical summary generator (`models/nlg/`)
+
+Goal: translate all model outputs into one structured plain-English report per patient per hour, readable by a doctor in under 30 seconds.
+
+Input payload (from `aggregator.py`):
+
+```json
+{
+  "patient_id": "...",
+  "stay_id": "...",
+  "timestamp": "...",
+  "sepsis": {
+    "probability": 0.74,
+    "alert": true,
+    "top_features": [
+      {"name": "lactate", "shap": 0.34},
+      {"name": "map",     "shap": 0.29}
+    ]
+  },
+  "bed_demand": {"24h": 12, "48h": 14, "72h": 11, "unit": "MICU"},
+  "ventilator": {
+    "need_probability": 0.61,
+    "predicted_duration_hours": 42,
+    "ci_80": [28, 68]
+  },
+  "los": {
+    "remaining_hours": 36,
+    "p10_hours": 18,
+    "p90_hours": 72
+  }
+}
+```
+
+Primary approach — LLM generation (`summary_generator.py`):
+- Call an LLM (OpenAI GPT-4o or local Llama 3) with a structured system prompt.
+- System prompt instructs the model to: use clinical language, quantify uncertainty, flag any red-flag combination (e.g., high sepsis risk + vent need), never hallucinate values.
+- Temperature = 0.1 (deterministic).
+
+Fallback — Jinja2 templates (`templates/`):
+- Template files for each alert level: `low_risk.j2`, `moderate_risk.j2`, `high_risk.j2`.
+- Used when LLM is unavailable or latency > 2 s.
+
+Output format (per patient):
+
+```
+[HIGH RISK — SEPSIS ALERT]
+Patient 1234 | MICU | 2025-06-01 14:00
+
+SEPSIS (74% probability, alert active)
+  Key drivers: elevated lactate (+0.34), low MAP (+0.29)
+  Recommended: review cultures, consider vasopressors
+
+VENTILATOR (61% probability of need within 24 h)
+  Predicted duration if initiated: ~42 h (80% CI: 28–68 h)
+
+LENGTH OF STAY
+  Estimated remaining: ~36 h (90% range: 18–72 h)
+
+UNIT BED FORECAST (MICU)
+  24 h: 12 beds  |  48 h: 14 beds  |  72 h: 11 beds
+```
+
+## 7. Explainability (shared)
+
+File: `src/explainability.py`
+
+| Method | Applied to | Notes |
+|--------|-----------|-------|
+| SHAP TreeExplainer | XGBoost models (sepsis, vent, LOS) | Exact, fast |
+| SHAP DeepExplainer | LSTM models | Approximate; use background of 200 samples |
+| LIME | Any model | Local linear approximation; validate top-5 features against SHAP |
+
+Requirements:
+- Every prediction must ship with its top-5 SHAP features and values.
+- Save waterfall plots to `outputs/shap/` for each evaluation batch.
+- Surface top-5 in the NLG payload under `top_features`.
+
+## 8. `aggregator.py`
+
+Collects outputs from all five models for a given `(stay_id, timestamp)` and builds the JSON payload shown in section 6.5. Called by `main.py` in inference mode.
+
+```python
+def aggregate(stay_id: str, timestamp: pd.Timestamp) -> dict:
+    features = load_features(stay_id, timestamp)
+    return {
+        "patient_id":  ...,
+        "stay_id":     stay_id,
+        "timestamp":   timestamp.isoformat(),
+        "sepsis":      sepsis_model.predict_with_explanation(features),
+        "bed_demand":  bed_model.forecast(timestamp),
+        "ventilator":  vent_model.predict(features),
+        "los":         los_model.predict(features),
+    }
+```
+
+## 9. `main.py` — pipeline modes
+
+```
+python src/main.py --mode train      # full pipeline: extract -> ETL -> features -> train all
+python src/main.py --mode evaluate   # load saved models, run on test set, produce plots
+python src/main.py --mode infer --stay_id <id>  # single-patient real-time prediction
+python src/main.py --mode explore    # run explore.py only
+```
+
+## 10. Evaluation targets
+
+| Model | Primary metric | Target |
+|-------|---------------|--------|
+| Sepsis predictor | AUROC | >= 0.86 |
+| Bed demand forecaster | MAPE | <= 15% |
+| Ventilator classifier | AUROC | >= 0.82 |
+| Ventilator duration | Median AE | <= 8 h |
+| LOS estimator | MAE | <= 24 h |
+
+Report all metrics on the temporal test set only. Never report on val.
+Save all metric summaries to `outputs/evaluation_report.json`.
+
+## 11. Non-negotiable engineering rules
+
+1. Never load `chartevents.csv.gz` or `labevents.csv.gz` fully into memory — chunks of 100,000 rows only.
+2. Temporal split always — random split leaks future data and inflates all metrics.
+3. SMOTE on training set only — never before splitting; never applied to val/test.
+4. All itemIDs and paths live in `config.py` — no magic numbers in model files.
+5. Train XGBoost before LSTM — it is fast and will catch bad features/labels before you invest GPU time.
+6. Parquet cache is sacred — once `vitals.parquet` and `labs.parquet` exist, never re-read the `.gz` files.
+7. Every prediction includes an explanation — no black-box outputs reach the clinician.
+8. Log all experiments to MLflow — model version, hyperparameters, val AUROC, test AUROC.
+9. Unit-test label creation — a single off-by-one error in the lookahead window silently destroys the model.
+10. NLG temperature <= 0.1 — the clinical summary must be deterministic and never hallucinate numeric values.
+
+## 12. Estimated timeline
+
+| Phase | Scope | Days |
+|-------|-------|------|
+| Env + repo scaffold | Steps 1–2 | 0.5–1 |
+| Data exploration | `explore.py` | 1–2 |
+| Extractor + ETL | Steps 3–4 | 3–4 |
+| Feature eng + labels | Steps 5–6 | 2–3 |
+| Sepsis model (XGB + LSTM + ensemble) | §6.1 | 3–4 |
+| Bed demand forecaster | §6.2 | 2–3 |
+| Ventilator forecaster | §6.3 | 2–3 |
+| LOS estimator | §6.4 | 2 |
+| NLG + aggregator | §6.5 + §8 | 2–3 |
+| Explainability + evaluation | §7 + §10 | 1–2 |
+| Total |  | ~3–4 weeks |
+
+The ETL phase (extractor + pipeline) is the longest and most critical.
+Once the parquet cache is solid, every model phase moves quickly.
