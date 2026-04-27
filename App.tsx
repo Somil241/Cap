@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { MOCK_FORECAST, MOCK_RESOURCES } from './constants';
 import { BedDemandData, Patient, ResourceNeed } from './types';
 import PatientCard from './components/PatientCard';
 import PatientAnalysis from './components/PatientAnalysis';
 import PredictiveChart from './components/PredictiveChart';
 import ResourceForecastCard from './components/ResourceForecastCard';
+import PatientUpload from './components/PatientUpload';
 import {
   fetchBedForecast,
   fetchPatients,
@@ -18,7 +19,6 @@ const App: React.FC = () => {
   const [resources, setResources] = useState<ResourceNeed[]>(MOCK_RESOURCES);
   const [isProcessing, setIsProcessing] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadDashboard = async (limit = 12) => {
     setIsProcessing(true);
@@ -47,13 +47,13 @@ const App: React.FC = () => {
 
   useEffect(() => { loadDashboard(12); }, []);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    // The "Upload Records" action used to fabricate patients via Groq.
-    // It now refreshes the dashboard with a fresh sample from the CDSS API.
-    await loadDashboard(12);
-    if (event.target) event.target.value = '';
+  const addPredictedPatients = (incoming: Patient[]) => {
+    if (!incoming.length) return;
+    setPatients(prev => {
+      const incomingIds = new Set(incoming.map(p => p.id));
+      return [...incoming, ...prev.filter(p => !incomingIds.has(p.id))];
+    });
+    setSelectedPatient(incoming[0]);
   };
 
   const criticalCount = patients.filter(p => p.sepsisRisk > 0.7).length;
@@ -83,9 +83,9 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex gap-4 items-center">
-            <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
+            {/* Refreshes the patient cohort from the backend — CSV upload is in the panel below */}
             <button
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => loadDashboard(12)}
               disabled={isProcessing}
               className="bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black uppercase tracking-widest px-4 py-2.5 rounded-xl transition-all shadow-lg shadow-indigo-600/20 whitespace-nowrap disabled:opacity-60"
             >
@@ -113,6 +113,7 @@ const App: React.FC = () => {
       )}
 
       <main className="max-w-[1600px] mx-auto w-full flex-1 p-4 md:p-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+
         {/* Side Panel */}
         <aside className="lg:col-span-3 space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-1 gap-4">
@@ -192,7 +193,7 @@ const App: React.FC = () => {
           </div>
         </aside>
 
-        {/* Main Content Area */}
+        {/* Main Content */}
         <div className="lg:col-span-9 space-y-8 min-w-0">
           {selectedPatient ? (
             <PatientAnalysis patient={selectedPatient} />
@@ -213,7 +214,6 @@ const App: React.FC = () => {
                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{isProcessing ? 'Syncing…' : 'Real-time'}</span>
               </div>
             </div>
-
             <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
               <div className="xl:col-span-7 overflow-hidden">
                 <PredictiveChart data={forecast} />
@@ -223,6 +223,10 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {/* Patient Data Ingestion — CSV upload + manual entry */}
+          <PatientUpload onPatientsPredicted={addPredictedPatients} />
+
         </div>
       </main>
 

@@ -41,6 +41,9 @@ export interface Patient {
   predictedLOS: number; 
   diagnosis: string;
   acuityLevel: 'Low' | 'Moderate' | 'High' | 'Critical';
+  localXai?: XAIFactor[];
+  localSummary?: string;
+  localHighlights?: string[];
 }
 
 export interface BedDemandData {

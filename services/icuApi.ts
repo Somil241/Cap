@@ -64,11 +64,15 @@ export async function runMLInference(_rawRow: unknown): Promise<Patient> {
 }
 
 export async function getClinicalSummary(patient: Patient): Promise<{ highlights: string[]; fullSummary: string }> {
+  if (patient.localSummary) {
+    return { highlights: patient.localHighlights ?? [], fullSummary: patient.localSummary };
+  }
   const s = await fetchSummary(patient.id);
   return { highlights: s.highlights, fullSummary: s.fullSummary };
 }
 
 export async function getXAIExplanation(patient: Patient): Promise<XAIFactor[]> {
+  if (patient.localXai) return patient.localXai;
   return fetchXAI(patient.id);
 }
 
@@ -106,5 +110,8 @@ function normalizePatient(p: any): Patient {
     predictedLOS: Number(p.predictedLOS ?? 0),
     diagnosis: String(p.diagnosis ?? "ICU Observation"),
     acuityLevel: (p.acuityLevel ?? "Low") as Patient["acuityLevel"],
+    localXai: Array.isArray(p.localXai) ? p.localXai : undefined,
+    localSummary: typeof p.localSummary === "string" ? p.localSummary : undefined,
+    localHighlights: Array.isArray(p.localHighlights) ? p.localHighlights : undefined,
   };
 }
