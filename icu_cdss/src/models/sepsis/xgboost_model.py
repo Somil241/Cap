@@ -5,7 +5,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
 
 from config import MODELS_DIR, PROCESSED_DIR
 
@@ -82,11 +82,31 @@ class SepsisXGBoost:
 
         val_prob = self.model.predict_proba(X_val)[:, 1]
         test_prob = self.model.predict_proba(X_test)[:, 1]
+
+        # F1-optimal threshold from val PR curve. With a ~1% positive rate,
+        # the default 0.5 is way too strict; without this, alerts are buried.
+        opt_thr = 0.5
+        opt_f1 = 0.0
+        moderate_thr = 0.3
+        if y_val.nunique() > 1 and len(y_val) > 0:
+            prec, rec, thr = precision_recall_curve(y_val, val_prob)
+            f1_curve = (2 * prec * rec) / (prec + rec + 1e-12)
+            best_idx = int(np.argmax(f1_curve[:-1])) if len(thr) else 0
+            opt_thr = float(thr[best_idx]) if len(thr) else 0.5
+            opt_f1 = float(f1_curve[best_idx])
+            # Moderate band = highest threshold whose recall is still >= 0.5
+            recall_ok = np.where(rec[:-1] >= 0.5)[0]
+            if recall_ok.size:
+                moderate_thr = float(thr[recall_ok[-1]])
+
         metrics = {
             "best_params": best,
             "val_auroc": float(roc_auc_score(y_val, val_prob)) if y_val.nunique() > 1 else 0.5,
             "test_auroc": float(roc_auc_score(y_test, test_prob)) if y_test.nunique() > 1 else 0.5,
             "val_f1_at_05": float(f1_score(y_val, (val_prob >= 0.5).astype(int))) if len(y_val) else 0.0,
+            "val_f1_at_optimal": opt_f1,
+            "optimal_threshold": opt_thr,
+            "moderate_threshold": moderate_thr,
             "n_features": len(self.features),
             "n_train": int(len(X_train)),
             "n_val": int(len(X_val)),
@@ -95,6 +115,9 @@ class SepsisXGBoost:
         self.save()
         with open(PROCESSED_DIR / "sepsis_xgb_metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
+        # Persist thresholds where the aggregator + dashboard can find them.
+        with open(MODELS_DIR / "sepsis_threshold.json", "w", encoding="utf-8") as f:
+            json.dump({"alert": opt_thr, "moderate": moderate_thr}, f, indent=2)
         return metrics
 
     def save(self) -> None:

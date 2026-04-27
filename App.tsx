@@ -56,7 +56,7 @@ const App: React.FC = () => {
     if (event.target) event.target.value = '';
   };
 
-  const criticalCount = patients.filter(p => p.sepsisRisk > 0.7).length;
+  const criticalCount = patients.filter(p => p.sepsisRisk >= 0.73).length;
   const avgLOS = patients.length
     ? (patients.reduce((acc, p) => acc + p.predictedLOS, 0) / patients.length).toFixed(1)
     : '—';

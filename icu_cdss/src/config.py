@@ -13,6 +13,8 @@ MIMIC_ICU_DIR = MIMIC_ROOT / "icu"
 MIMIC_HOSP_DIR = MIMIC_ROOT / "hosp"
 
 # Vital sign itemIDs
+# GCS is stored per component in MIMIC-IV-3.1 — Total = Eye + Verbal + Motor.
+# 223900 alone is ONLY the Verbal subscore (1–5), not total GCS (3–15).
 VITAL_ITEMIDS = {
     "heart_rate": 220045,
     "spo2": 220277,
@@ -21,8 +23,12 @@ VITAL_ITEMIDS = {
     "mbp": 220052,
     "resp_rate": 220210,
     "temperature": 223761,
-    "gcs_total": 223900,
+    "gcs_eye": 220739,
+    "gcs_verbal": 223900,
+    "gcs_motor": 223901,
 }
+
+GCS_COMPONENTS = ["gcs_eye", "gcs_verbal", "gcs_motor"]
 
 # Lab itemIDs
 LAB_ITEMIDS = {

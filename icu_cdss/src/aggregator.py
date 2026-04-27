@@ -15,10 +15,14 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from config import MIMIC_ICU_DIR, MODELS_DIR, PROCESSED_DIR
+from config import LOS_MAX_DAYS, MIMIC_ICU_DIR, MODELS_DIR, PROCESSED_DIR
 from explainability import top_shap_features_tree
 from models.nlg.summary_generator import generate_summary
 from utils import mimic_file
+
+
+_LOS_MAX_HOURS = float(LOS_MAX_DAYS * 24)
+_LOS_MIN_HOURS = 0.5
 
 
 def _scalar(x) -> float:
@@ -29,6 +33,13 @@ def _scalar(x) -> float:
         return float(x)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def _bound_hours(x: float) -> float | None:
+    """Clamp a predicted-hours value to the trained label range, or None if non-finite."""
+    if x is None or not np.isfinite(x):
+        return None
+    return float(np.clip(x, _LOS_MIN_HOURS, _LOS_MAX_HOURS))
 
 
 def _load_xgb(model_path: Path, features_path: Path) -> tuple[xgb.XGBClassifier | None, list[str]]:
@@ -95,12 +106,25 @@ def aggregate(stay_id: str | int, timestamp: pd.Timestamp | None = None) -> dict
 
     # Sepsis
     sepsis_model, sepsis_feats = _load_xgb(MODELS_DIR / "sepsis_xgb.ubj", MODELS_DIR / "sepsis_xgb_features.json")
-    sepsis_block: dict = {"probability": None, "alert": False, "top_features": []}
+    thr_path = MODELS_DIR / "sepsis_threshold.json"
+    if thr_path.exists():
+        thr_doc = json.loads(thr_path.read_text(encoding="utf-8"))
+        alert_thr = float(thr_doc.get("alert", 0.5))
+        moderate_thr = float(thr_doc.get("moderate", 0.3))
+    else:
+        alert_thr, moderate_thr = 0.5, 0.3
+    sepsis_block: dict = {
+        "probability": None,
+        "alert": False,
+        "alert_threshold": alert_thr,
+        "moderate_threshold": moderate_thr,
+        "top_features": [],
+    }
     if sepsis_model is not None:
         X = _select(row, sepsis_feats)
         prob = float(sepsis_model.predict_proba(X)[0, 1])
         sepsis_block["probability"] = prob
-        sepsis_block["alert"] = prob >= 0.5
+        sepsis_block["alert"] = prob >= alert_thr
         try:
             sepsis_block["top_features"] = top_shap_features_tree(sepsis_model, X, top_k=5)
         except Exception:
@@ -146,7 +170,7 @@ def aggregate(stay_id: str | int, timestamp: pd.Timestamp | None = None) -> dict
     if los_lgb is not None and los_feats_path.exists():
         feats = json.loads(los_feats_path.read_text(encoding="utf-8"))
         X = _select(row, feats).to_numpy()
-        los_block["remaining_hours"] = float(los_lgb.predict(X)[0])
+        los_block["remaining_hours"] = _bound_hours(float(los_lgb.predict(X)[0]))
     aft_path = MODELS_DIR / "los_aft.pkl"
     aft_feats_path = MODELS_DIR / "los_aft_features.json"
     if aft_path.exists() and aft_feats_path.exists():
@@ -156,9 +180,12 @@ def aggregate(stay_id: str | int, timestamp: pd.Timestamp | None = None) -> dict
                 aft = pickle.load(fh)
             feats = json.loads(aft_feats_path.read_text(encoding="utf-8"))
             X = _select(row, feats)
-            # 90% range of remaining LOS = [p=0.9 lower bound, p=0.1 upper bound]
-            los_block["p10_hours"] = _scalar(aft.predict_percentile(X, p=0.9))
-            los_block["p90_hours"] = _scalar(aft.predict_percentile(X, p=0.1))
+            # lifelines uses p = fraction surviving, so p=0.9 → early time
+            # (lower bound of LOS), p=0.1 → late time (upper bound).
+            # Clamp to the trained label range — the AFT's exp(coef·x) is
+            # numerically unstable when fed unclipped raw vitals.
+            los_block["p10_hours"] = _bound_hours(_scalar(aft.predict_percentile(X, p=0.9)))
+            los_block["p90_hours"] = _bound_hours(_scalar(aft.predict_percentile(X, p=0.1)))
         except Exception:
             pass
 

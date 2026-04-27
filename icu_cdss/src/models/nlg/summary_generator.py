@@ -39,12 +39,12 @@ def _beds(x) -> str:
     return f"{round(float(x), 1)}" if x is not None else "n/a"
 
 
-def _banner(prob) -> str:
+def _banner(prob, alert_thr: float = 0.5, moderate_thr: float = 0.3) -> str:
     if prob is None:
         return "REPORT — DATA INCOMPLETE"
-    if prob >= 0.7:
+    if prob >= alert_thr:
         return "HIGH RISK — SEPSIS ALERT"
-    if prob >= 0.4:
+    if prob >= moderate_thr:
         return "MODERATE RISK"
     return "LOW RISK"
 
@@ -60,8 +60,10 @@ def generate_summary(payload: dict) -> str:
         ", ".join(f"{x.get('name','?')} ({x.get('shap',0):+.2f})" for x in top[:3])
         if top else "n/a"
     )
+    alert_thr = float(sep.get("alert_threshold", 0.5))
+    moderate_thr = float(sep.get("moderate_threshold", 0.3))
     return REPORT.render(
-        banner=_banner(sep.get("probability")),
+        banner=_banner(sep.get("probability"), alert_thr, moderate_thr),
         patient_id=payload.get("patient_id", "unknown"),
         unit=bed.get("unit", "ICU"),
         timestamp=payload.get("timestamp", ""),

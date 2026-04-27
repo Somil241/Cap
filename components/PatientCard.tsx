@@ -9,9 +9,13 @@ interface Props {
 }
 
 const PatientCard: React.FC<Props> = ({ patient, isActive, onClick }) => {
+  // Tuned to the trained model's calibration. Because the sepsis classifier
+  // is fit on a SMOTE-balanced train set, positive probabilities cluster
+  // high; the F1-optimal threshold on raw-prevalence val data is ~0.73.
+  // Backend writes models/sepsis_threshold.json; mirror those values here.
   const getRiskStyles = (risk: number) => {
-    if (risk > 0.7) return 'text-red-400 bg-red-950/30 border-red-900/50';
-    if (risk > 0.4) return 'text-orange-400 bg-orange-950/30 border-orange-900/50';
+    if (risk >= 0.73) return 'text-red-400 bg-red-950/30 border-red-900/50';
+    if (risk >= 0.44) return 'text-orange-400 bg-orange-950/30 border-orange-900/50';
     return 'text-emerald-400 bg-emerald-950/30 border-emerald-900/50';
   };
 
